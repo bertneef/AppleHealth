@@ -165,6 +165,136 @@ cat(paste("Heart rate data found for",
           nrow(running_workouts),
           "workouts (from WorkoutStatistics)\n"))
 
+# OVERLAP DETECTION
+cat("\nDetecting overlapping workouts...\n")
+
+# Initialize overlap columns
+running_workouts$has_overlap <- FALSE
+running_workouts$overlaps_with_idx <- NA_character_
+running_workouts$keep_workout <- TRUE
+running_workouts$remove_reason <- NA_character_
+
+# Sort by start date for efficient comparison
+running_workouts <- running_workouts %>% arrange(start_date)
+
+# Check each workout against others
+n <- nrow(running_workouts)
+for (i in 1:(n-1)) {
+  # Only check workouts that haven't been marked as overlapping yet
+  if (running_workouts$has_overlap[i]) next
+
+  w1_start <- running_workouts$start_date[i]
+  w1_end <- running_workouts$end_date[i]
+  w1_duration <- running_workouts$duration[i]
+  w1_distance <- running_workouts$distance[i]
+  w1_source <- running_workouts$source_name[i]
+
+  # Look for overlaps within a reasonable time window (same day)
+  for (j in (i+1):n) {
+    w2_start <- running_workouts$start_date[j]
+
+    # Stop if we're beyond possible overlap (more than 24 hours later)
+    if (as.numeric(difftime(w2_start, w1_start, units = "hours")) > 24) break
+
+    w2_end <- running_workouts$end_date[j]
+    w2_duration <- running_workouts$duration[j]
+    w2_distance <- running_workouts$distance[j]
+    w2_source <- running_workouts$source_name[j]
+
+    # Calculate overlap
+    overlap_start <- max(w1_start, w2_start)
+    overlap_end <- min(w1_end, w2_end)
+
+    if (overlap_start < overlap_end) {
+      # There is time overlap
+      overlap_duration <- as.numeric(difftime(overlap_end, overlap_start, units = "secs"))
+      overlap_pct_w1 <- overlap_duration / w1_duration
+      overlap_pct_w2 <- overlap_duration / w2_duration
+
+      # Significant overlap if >50% of either workout overlaps
+      if (overlap_pct_w1 > 0.5 || overlap_pct_w2 > 0.5) {
+        # Mark both as having overlap
+        running_workouts$has_overlap[i] <- TRUE
+        running_workouts$has_overlap[j] <- TRUE
+
+        # Track which workouts overlap (store as comma-separated list of indices)
+        if (is.na(running_workouts$overlaps_with_idx[i])) {
+          running_workouts$overlaps_with_idx[i] <- as.character(j)
+        } else {
+          running_workouts$overlaps_with_idx[i] <- paste(running_workouts$overlaps_with_idx[i], j, sep = ",")
+        }
+
+        if (is.na(running_workouts$overlaps_with_idx[j])) {
+          running_workouts$overlaps_with_idx[j] <- as.character(i)
+        } else {
+          running_workouts$overlaps_with_idx[j] <- paste(running_workouts$overlaps_with_idx[j], i, sep = ",")
+        }
+
+        # DECISION LOGIC: Which workout to keep?
+        # Priority 1: Nike Run Club is primary source (unless suspiciously short)
+        is_nike_1 <- grepl("Nike", w1_source, ignore.case = TRUE)
+        is_nike_2 <- grepl("Nike", w2_source, ignore.case = TRUE)
+
+        # Check if Nike workout is suspiciously short
+        if (is_nike_1 && !is_nike_2) {
+          # Nike is workout 1
+          if (!is.na(w1_distance) && !is.na(w2_distance) &&
+              w1_distance < 0.5 * w2_distance && w2_duration > 1.5 * w1_duration) {
+            # Nike workout is suspiciously short, keep the other one
+            running_workouts$keep_workout[i] <- FALSE
+            running_workouts$remove_reason[i] <- "Nike workout suspiciously short compared to overlapping workout"
+          } else {
+            # Keep Nike, remove the other
+            running_workouts$keep_workout[j] <- FALSE
+            running_workouts$remove_reason[j] <- "Duplicate: Nike Run Club is primary source"
+          }
+        } else if (is_nike_2 && !is_nike_1) {
+          # Nike is workout 2
+          if (!is.na(w2_distance) && !is.na(w1_distance) &&
+              w2_distance < 0.5 * w1_distance && w1_duration > 1.5 * w2_duration) {
+            # Nike workout is suspiciously short, keep the other one
+            running_workouts$keep_workout[j] <- FALSE
+            running_workouts$remove_reason[j] <- "Nike workout suspiciously short compared to overlapping workout"
+          } else {
+            # Keep Nike, remove the other
+            running_workouts$keep_workout[i] <- FALSE
+            running_workouts$remove_reason[i] <- "Duplicate: Nike Run Club is primary source"
+          }
+        } else {
+          # Neither is Nike, or both are Nike - use tie-breaker
+          # Priority 2: Keep workout with more complete data
+          w1_completeness <- sum(!is.na(c(w1_distance, running_workouts$avg_heart_rate[i],
+                                          running_workouts$energy[i])))
+          w2_completeness <- sum(!is.na(c(w2_distance, running_workouts$avg_heart_rate[j],
+                                          running_workouts$energy[j])))
+
+          if (w1_completeness > w2_completeness) {
+            running_workouts$keep_workout[j] <- FALSE
+            running_workouts$remove_reason[j] <- "Duplicate: Other workout has more complete data"
+          } else if (w2_completeness > w1_completeness) {
+            running_workouts$keep_workout[i] <- FALSE
+            running_workouts$remove_reason[i] <- "Duplicate: Other workout has more complete data"
+          } else {
+            # Same completeness - keep the longer workout
+            if (w1_duration >= w2_duration) {
+              running_workouts$keep_workout[j] <- FALSE
+              running_workouts$remove_reason[j] <- "Duplicate: Other workout is longer"
+            } else {
+              running_workouts$keep_workout[i] <- FALSE
+              running_workouts$remove_reason[i] <- "Duplicate: Other workout is longer"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+overlap_count <- sum(running_workouts$has_overlap)
+remove_count <- sum(!running_workouts$keep_workout)
+cat(paste("Found", overlap_count, "workouts with overlaps\n"))
+cat(paste("Marked", remove_count, "workouts for removal\n"))
+
 # FALLBACK: Extract HR from individual Records for workouts missing HR data
 # (e.g., Nike Run Club, older Apple Watch workouts)
 workouts_missing_hr <- which(is.na(running_workouts$avg_heart_rate))
